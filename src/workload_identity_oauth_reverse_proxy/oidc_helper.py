@@ -6,6 +6,7 @@ import datetime
 import dataclasses
 import urllib.error
 import urllib.request
+import urllib.parse
 from typing import Dict, List, Optional, Any, Callable
 
 import jwt
@@ -165,28 +166,28 @@ class OIDCToken:
             raise UnauthorizedException("Unable to authenticate you, no token")
         elif token.count(".") != 2:
             raise UnauthorizedException("Invalid token")
-        # actx extracted from audiance. Audiance rebuilt and then
-        # used to validate against extracted actx roles  policies
+
+        # actx extracted from audience. Audience rebuilt and then
+        # used to validate against extracted actx roles policies
         unverified_payload = jwt.decode(token, options={"verify_signature": False})
-        unverified_issuer = unverified_payload.get("iss")
         unverified_audience = unverified_payload.get("aud")
         parsed_url = urllib.parse.urlparse(unverified_audience)
-        query_string = parsed_url.query
-        query_params = urllib.parse.parse_qs(query_string)
-        import snoop
+        query_params = urllib.parse.parse_qs(parsed_url.query)
 
-        snoop.pp(query_params)
-        if len(query_params["actx"]) != 1:
+        if "actx" not in query_params or len(query_params["actx"]) != 1:
             raise UnauthorizedException(
                 f"aud does not have actx: api://{parsed_url.hostname}?actx=<identifier>"
             )
+
         actx = query_params["actx"][0]
         api = unverified_audience.split("api://", maxsplit=1)[1].split("?", maxsplit=1)[
             0
         ]
+
         issuers = [THIS_ENDPOINT]
         issuers.extend(get_issuers(api, actx))
         issuers = list(set(issuers))
+
         config = OIDCValidatorConfig(
             issuers=issuers,
             audience=f"api://{api}?actx={actx}",
@@ -194,9 +195,16 @@ class OIDCToken:
             leeway=0,
             claim_schema=None,
         )
+
         logger.info(f"Validating token using config: {config}")
         oidc = OIDCValidator(config)
-        claims = oidc.validate_token(token)
+
+        try:
+            claims = oidc.validate_token(token)
+        except OIDCValidatorError as e:
+            # Expired/invalid tokens must be a clean 401, not a 500
+            raise UnauthorizedException("Invalid or expired token") from e
+
         audience = claims.get("aud")
         subject = claims.get("sub")
         return cls(

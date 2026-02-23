@@ -1,10 +1,28 @@
 import sys
 import json
+import os
 
 from ..... import do_api
 from ..... import cgi_helper
 from ..... import oidc_helper
 from ..... import oauth_helper
+
+
+def _int_env(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        # If env is misconfigured, fail safe with default rather than crashing the whole endpoint
+        return default
+
+
+# 30 days default; clamp to [15 minutes, 365 days]
+_DEFAULT_REFRESH_TTL = 60 * 60 * 24 * 30
+_REFRESH_TTL_SECONDS = _int_env("ID_TOKEN_REFRESH_TTL_SECONDS", _DEFAULT_REFRESH_TTL)
+_REFRESH_TTL_SECONDS = max(60 * 15, min(_REFRESH_TTL_SECONDS, 60 * 60 * 24 * 365))
 
 
 @cgi_helper.json_response
@@ -43,21 +61,20 @@ def cgi_handler():
         + [
             tag.split(":", maxsplit=1)[1]
             for tag in droplet["tags"]
-            if tag.startswith("oidc-sub:") and tag.count(":") == 2 and tag.split(":")[1] != "actx"
+            if tag.startswith("oidc-sub:")
+            and tag.count(":") == 2
+            and tag.split(":")[1] != "actx"
         ]
     )
 
     claims = {"sub": subject, "droplet_id": droplet["id"]}
-    import snoop
-    snoop.pp(claims)
 
     refresh_claims = {
         "sub": expected_refresh_subject,
         "id-token-refresh": True,
-        "ttl": 60 * 15,
+        "ttl": _REFRESH_TTL_SECONDS,
         "droplet_id": oidc_token.claims["droplet_id"],
     }
-    snoop.pp(refresh_claims)
 
     return {
         "token": oidc_helper.OIDCToken.create(
