@@ -1,102 +1,91 @@
 #!/usr/bin/env python3
-"""
-/v1/oidc/refresh
+"""/v1/oidc/refresh (CGI)
 
-- Takes a refresh token (Bearer).
-- Validates it is role:id-token-refresh and not expired.
-- Rotates the refresh token (returns a NEW refresh_token) + returns a fresh access token.
+Validates a refresh token and returns:
+  - short-lived ID token (token)
+  - rotated refresh token (refresh_token)
 
-Env:
-  ID_TOKEN_TTL_SECONDS: access token TTL (recommended 900)
-  ID_TOKEN_REFRESH_TTL_SECONDS: refresh token TTL (recommended 2592000 = 30 days)
+Runtime env (recommended):
+  ID_TOKEN_TTL_SECONDS=900
+  ID_TOKEN_REFRESH_TTL_SECONDS=2592000   # 30 days
 """
 
 import json
 import os
-import time
 
-import jwt
-
-import cgi_helper
-import do_api
-import oidc_helper
+from . import cgi_helper
+from . import do_api
+from . import oauth_helper
+from . import oidc_helper
 
 
-def _json_error(code: int, err_id: str, message: str):
-    return code, {"Content-Type": "application/json"}, json.dumps({"id": err_id, "message": message})
+DEFAULT_ID_TOKEN_TTL_SECONDS = 900
+DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
 
 
-def _get_bearer_token(environ) -> str:
-    auth = environ.get("HTTP_AUTHORIZATION", "") or ""
-    parts = auth.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1].strip()
-    return ""
-
-
-def _decode_unverified(token: str) -> dict:
-    return jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
-
-
-def handler(env, _):
-    tok = _get_bearer_token(env)
-    if not tok:
-        return _json_error(401, "unauthorized", "Missing Bearer token")
-
-    # quick exp check so invalid/expired tokens are 401 (not 500)
+def _int_env(name: str, default: int) -> int:
     try:
-        payload = _decode_unverified(tok)
+        v = int(os.environ.get(name, str(default)).strip())
+        return v if v > 0 else default
     except Exception:
-        return _json_error(401, "unauthorized", "Invalid token")
+        return default
 
-    now = int(time.time())
-    exp = int(payload.get("exp") or 0)
-    if exp and exp < now:
-        return _json_error(401, "unauthorized", "Invalid or expired token")
+
+@cgi_helper.json_response
+def main() -> dict:
+    token, _ = cgi_helper.get_token()
 
     try:
-        oidc_token = oidc_helper.OIDCToken.from_string(tok)
-        oidc_token.assert_is_role("id-token-refresh")
+        oidc_token = oidc_helper.OIDCToken.validate(token)
     except Exception:
-        return _json_error(401, "unauthorized", "Invalid or expired token")
+        raise cgi_helper.UnauthorizedException("invalid_or_expired_refresh_token")
 
-    # load droplet to re-derive subject from tags (source of truth)
+    if not oidc_token.claims.get("id-token-refresh"):
+        raise cgi_helper.UnauthorizedException("not_a_refresh_token")
+
+    droplet_id = oidc_token.claims.get("droplet_id")
+    if not droplet_id:
+        raise cgi_helper.UnauthorizedException("refresh_token_missing_droplet_id")
+
     try:
-        droplet = do_api.do_droplet_get(oidc_token.droplet_id)
+        team_token = oauth_helper.retrieve_oauth_token(oidc_token.actx)
+        droplet = do_api.do_droplet_get(team_token, droplet_id)
     except Exception:
-        return _json_error(401, "unauthorized", "Invalid or expired token")
+        raise cgi_helper.ServerException("droplet_lookup_failed")
 
-    subjects = do_api.extract_subs_from_tags(droplet.get("tags") or [])
-    if not subjects:
-        return _json_error(401, "unauthorized", "Droplet missing oidc-sub tag")
+    sub = f"actx:{oidc_token.actx}:role:id-token"
+    for tag in droplet.get("tags", []) or []:
+        if isinstance(tag, str) and tag.startswith("oidc-sub:"):
+            sub = tag[len("oidc-sub:") :]
+            break
 
-    access_ttl = int(os.environ.get("ID_TOKEN_TTL_SECONDS", "900"))
-    refresh_ttl = int(os.environ.get("ID_TOKEN_REFRESH_TTL_SECONDS", "2592000"))
+    id_ttl = _int_env("ID_TOKEN_TTL_SECONDS", DEFAULT_ID_TOKEN_TTL_SECONDS)
+    refresh_ttl = _int_env("ID_TOKEN_REFRESH_TTL_SECONDS", DEFAULT_REFRESH_TTL_SECONDS)
 
-    claims = {
-        "sub": subjects[0],
-        "droplet_id": droplet["id"],
-        "ttl": access_ttl,
-    }
-
-    refresh_claims = {
-        "sub": f"actx:{oidc_token.actx}:role:id-token-refresh",
-        "id-token-refresh": True,
-        "droplet_id": droplet["id"],
-        "ttl": refresh_ttl,
-    }
-
-    return (
-        200,
-        {"Content-Type": "application/json"},
-        json.dumps(
-            {
-                "token": oidc_helper.OIDCToken.create(oidc_token.actx, claims).as_string,
-                "refresh_token": oidc_helper.OIDCToken.create(oidc_token.actx, refresh_claims).as_string,
-            }
-        ),
+    access_token = oidc_helper.OIDCToken.create(
+        oidc_token.actx,
+        {"sub": sub, "droplet_id": droplet_id, "ttl": id_ttl},
     )
+
+    rotated_refresh = oidc_helper.OIDCToken.create(
+        oidc_token.actx,
+        {
+            "sub": f"actx:{oidc_token.actx}:role:id-token-refresh",
+            "droplet_id": droplet_id,
+            "id-token-refresh": True,
+            "ttl": refresh_ttl,
+        },
+    )
+
+    return {
+        "token": access_token.as_string,
+        "refresh_token": rotated_refresh.as_string,
+        "ttl_seconds": id_ttl,
+        "refresh_ttl_seconds": refresh_ttl,
+        "droplet_id": droplet_id,
+        "sub": sub,
+    }
 
 
 if __name__ == "__main__":
-    cgi_helper.cgid(handler)
+    print(json.dumps(main()))
