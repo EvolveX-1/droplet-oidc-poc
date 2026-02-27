@@ -3,25 +3,11 @@ import jwcrypto.jwk
 from .common import THIS_ENDPOINT
 from . import database
 
-# -----------------------------------------------------------------------------
-# jwt_helper.py
-#
-# This module is used by multiple parts of the Droplet OIDC PoC:
-#  - issuing provisioning tokens (used by /v2/droplets)
-#  - issuing short-lived id/access tokens (used by /v1/oidc/issue, /prove, /refresh)
-#
-# Different modules may import different symbols from here. To avoid breakage,
-# we keep a backward-compatible surface:
-#   - key            : PRIVATE signing key (PEM string) for PyJWT jwt.encode(...)
-#   - public_key_pem : PUBLIC key PEM (string) for publishing JWKS / verification
-#   - JWT_ISSUER_URL : issuer
-#   - JWT_ALGORITHM  : algorithm name for PyJWT
-# -----------------------------------------------------------------------------
 
 JWT_ISSUER_URL = THIS_ENDPOINT
 JWT_ALGORITHM = "RS256"
 
-# Load or generate private key
+# Load or generate private key (stored per-issuer URL)
 JWT_SIGNING_KEY_PRIVATE_PEM = database.get_jwk_pem(JWT_ISSUER_URL)
 generate_jwk = bool(JWT_SIGNING_KEY_PRIVATE_PEM is None)
 
@@ -42,14 +28,11 @@ JWT_SIGNING_KEY_PRIVATE_PEM = JWT_SIGNING_KEY_PRIVATE.export_to_pem(
 if generate_jwk:
     database.save_jwk_pem(JWT_ISSUER_URL, JWT_SIGNING_KEY_PRIVATE_PEM.decode())
 
-# -----------------------------------------------------------------------------
-# Backward-compatible aliases expected by other modules
-# -----------------------------------------------------------------------------
-
-# PyJWT accepts key as a PEM-encoded private key string/bytes.
-# Some code paths expect jwt_helper.key (module attribute).
-key = JWT_SIGNING_KEY_PRIVATE_PEM.decode()
-
-# Convenience exports (strings) used by JWKS publishing / verification.
-private_key_pem = JWT_SIGNING_KEY_PRIVATE_PEM.decode()
-public_key_pem = JWT_SIGNING_KEY_PUBLIC_PEM.decode()
+# -------------------------------------------------------------------
+# Backward-compat exports (some code paths expect jwt_helper.key)
+# PyJWT accepts PEM bytes for RSA signing.
+# -------------------------------------------------------------------
+key = JWT_SIGNING_KEY_PRIVATE_PEM  # bytes (private key PEM)
+public_key = JWT_SIGNING_KEY_PUBLIC_PEM  # bytes (public key PEM)
+algorithm = JWT_ALGORITHM
+issuer = JWT_ISSUER_URL
