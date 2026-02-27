@@ -1,3 +1,4 @@
+import os
 import sys
 import uuid
 import socket
@@ -25,6 +26,20 @@ DEFAULT_NONCE_LEN = 64
 # Max 15 minutes to spin up in case of long user_data scripts
 DEFAULT_TTL_SECONDS = 60 * 15
 
+
+PROVISIONING_TOKEN_TTL_ENV = "PROVISIONING_TOKEN_TTL_SECONDS"
+
+
+def _get_default_ttl_seconds() -> int:
+    v = os.environ.get(PROVISIONING_TOKEN_TTL_ENV, "").strip()
+    if not v:
+        return DEFAULT_TTL_SECONDS
+    try:
+        n = int(v)
+        # guardrails: 60s .. 3600s
+        return max(60, min(3600, n))
+    except Exception:
+        return DEFAULT_TTL_SECONDS
 
 @dataclasses.dataclass
 class ProvisioningData:
