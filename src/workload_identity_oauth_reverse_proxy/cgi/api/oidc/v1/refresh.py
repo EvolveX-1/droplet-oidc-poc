@@ -2,13 +2,17 @@ import sys
 import json
 import os
 
-from ..... import do_api
 from ..... import cgi_helper
 from ..... import oidc_helper
-import oauth_helper
+
+# no-callback refresh:
+# - validates refresh token (Bearer)
+# - mints NEW access token + rotates refresh token
+# - does NOT call any droplet API / callback
+# - requires refresh token to contain "oidc_sub" (set in prove.py)
 
 def _env_int(name: str, default: int) -> int:
-    v = os.environ.get(name, "").strip()
+    v = (os.environ.get(name) or "").strip()
     if not v:
         return default
     try:
@@ -18,52 +22,36 @@ def _env_int(name: str, default: int) -> int:
 
 @cgi_helper.json_response
 def cgi_handler():
+    # body is currently unused, but keep JSON parsing to match previous behavior
+    try:
+        _ = json.load(sys.stdin)
+    except Exception:
+        _ = {}
+
     token, _token_is_oidc = cgi_helper.get_token()
-    oidc_token = oidc_helper.OIDCToken.validate(token)
+    refresh = oidc_helper.OIDCToken.validate(token)
 
-    if "droplet_id" not in oidc_token.claims:
-        raise cgi_helper.UnauthorizedException("refresh token does not have droplet_id claim")
-    if not oidc_token.claims.get("id-token-refresh", False):
-        raise cgi_helper.UnauthorizedException("refresh token does not have id-token-refresh: true claim")
+    if not refresh.claims.get("id-token-refresh"):
+        raise cgi_helper.UnauthorizedException("not a refresh token")
 
-    actx_slug = f"actx:{oidc_token.actx}"
-    expected_refresh_subject = f"{actx_slug}:role:id-token-refresh"
-    if expected_refresh_subject != oidc_token.sub:
-        raise cgi_helper.UnauthorizedException(
-            f"subject should have been {expected_refresh_subject!r} but was {oidc_token.sub!r}"
-        )
+    subject = refresh.claims.get("oidc_sub")
+    if not subject:
+        raise cgi_helper.UnauthorizedException("refresh token missing oidc_sub (redeploy prove.py and re-seed)")
 
-    droplet_id = oidc_token.claims["droplet_id"]
+    access_ttl = _env_int("ID_TOKEN_TTL_SECONDS", 900)               # 15 minutes
+    refresh_ttl = _env_int("ID_TOKEN_REFRESH_TTL_SECONDS", 2592000)  # 30 days
 
-    # Use team token for upstream API call
-    team_token = oauth_helper.retrieve_oauth_token(oidc_token.actx)
-    droplet = do_api.do_droplet_get(team_token, droplet_id)
-
-    subject = ":".join(
-        [actx_slug]
-        + [
-            tag.split(":", maxsplit=1)[1]
-            for tag in droplet["tags"]
-            if tag.startswith("oidc-sub:")
-            and tag.count(":") == 2
-            and tag.split(":")[1] != "actx"
-        ]
-    )
-
-    access_ttl = _env_int("ID_TOKEN_TTL_SECONDS", 900)
-    refresh_ttl = _env_int("ID_TOKEN_REFRESH_TTL_SECONDS", 2592000)
-
-    claims = {"sub": subject, "droplet_id": droplet["id"], "ttl": access_ttl}
+    access_claims = {"sub": subject, "ttl": access_ttl}
     refresh_claims = {
-        "sub": expected_refresh_subject,
+        "sub": refresh.claims.get("sub") or f"actx:{refresh.actx}:role:id-token-refresh",
         "id-token-refresh": True,
         "ttl": refresh_ttl,
-        "droplet_id": oidc_token.claims["droplet_id"],
+        "oidc_sub": subject,
     }
 
     return {
-        "token": oidc_helper.OIDCToken.create(oidc_token.actx, claims).as_string,
-        "refresh_token": oidc_helper.OIDCToken.create(oidc_token.actx, refresh_claims).as_string,
+        "token": oidc_helper.OIDCToken.create(refresh.actx, access_claims).as_string,
+        "refresh_token": oidc_helper.OIDCToken.create(refresh.actx, refresh_claims).as_string,
     }
 
 if __name__ == "__main__":
