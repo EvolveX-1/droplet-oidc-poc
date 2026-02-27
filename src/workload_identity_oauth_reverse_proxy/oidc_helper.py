@@ -1,76 +1,212 @@
-import dataclasses
-import base64
-import datetime
 import json
-import os
+import copy
+import uuid
+import logging
+import datetime
+import dataclasses
 import urllib.error
 import urllib.request
-import urllib.parse
+from typing import Dict, List, Optional, Any, Callable
 
 import jwt
+import jsonschema
 
-from . import jwt_helper
-from . import cgi_helper
+from .common import THIS_ENDPOINT
+from .jwt_helper import *
+from .cgi_helper import UnauthorizedException
 
-def _env_int(name: str, default: int) -> int:
-    v = os.environ.get(name, "").strip()
-    if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
+
+def only_own_issuer(_api: str, _actx: str) -> list[str]:
+    global THIS_ENDPOINT
+    return [THIS_ENDPOINT]
+
+
+class OIDCValidatorError(Exception):
+    pass
+
+
+@dataclasses.dataclass
+class OIDCValidatorConfig:
+    issuers: List[str]
+    audience: str
+    strict_aud: bool = True
+    leeway: int = 0
+    claim_schema: Optional[Dict[str, Any]] = None
+
+
+class OIDCValidator:
+    def __init__(self, config: OIDCValidatorConfig):
+        self.config = config
+        self.oidc_configs = {}
+        self.jwks_clients = {}
+        self.logger = logging.getLogger(__package__).getChild(
+            self.__class__.__qualname__
+        )
+
+        for issuer in self.config.issuers:
+            oidc_config_url = f"{issuer}/.well-known/openid-configuration"
+            try:
+                with urllib.request.urlopen(oidc_config_url) as response:
+                    response_body = response.read()
+                    self.oidc_configs[issuer] = json.loads(response_body)
+
+            except (urllib.error.URLError, json.JSONDecodeError) as e:
+                raise OIDCValidatorError(
+                    f"Failed to fetch or parse OIDC config from {oidc_config_url}"
+                ) from e
+
+            # The PyJWKClient handles its own requests for the JWKS URI
+            jwks_uri = self.oidc_configs[issuer]["jwks_uri"]
+            self.jwks_clients[issuer] = jwt.PyJWKClient(jwks_uri)
+
+    def validate_token(self, token: str) -> Dict:
+        last_error = jwt.PyJWTError(
+            f"Token is not valid for any of the issuers: {list(self.jwks_clients.keys())}"
+        )
+        for issuer, jwk_client in self.jwks_clients.items():
+            try:
+                signing_key = jwk_client.get_signing_key_from_jwt(token)
+                claims = jwt.decode(
+                    token,
+                    key=signing_key.key,
+                    algorithms=self.oidc_configs[issuer][
+                        "id_token_signing_alg_values_supported"
+                    ],
+                    audience=self.config.audience,
+                    issuer=self.oidc_configs[issuer]["issuer"],
+                    options={
+                        "require": ["exp", "iat", "iss", "sub"],
+                        "strict_aud": self.config.strict_aud,
+                    },
+                    leeway=self.config.leeway,
+                )
+                if self.config.claim_schema and issuer in self.config.claim_schema:
+                    jsonschema.validate(claims, schema=self.config.claim_schema[issuer])
+                return claims
+            except jwt.PyJWTError as error:
+                last_error = error
+        raise OIDCValidatorError(
+            "OIDC token failed validation against known issuers"
+        ) from last_error
+
 
 @dataclasses.dataclass
 class OIDCToken:
+    def __init__(self, payload: dict, actx: str | None = None):
+        self.payload = payload
+        self.actx = actx
     actx: str
+    api: str
+    aud: str
     sub: str
     claims: dict
+    as_string: str
 
-    @property
-    def as_string(self) -> str:
-        return jwt.encode(self.claims, jwt_helper.key, algorithm="RS256")
+    @classmethod
+    def create(cls, actx: str, claims: dict, api: str | None = None) -> "OIDCToken":
+        global JWT_ISSUER_URL
+        global JWT_SIGNING_KEY_PRIVATE_PEM
+        global JWT_ALGORITHM
 
-    @staticmethod
-    def validate(token: str, api=None):
-        # quick structural check
-        if token.count(".") != 2:
-            raise cgi_helper.UnauthorizedException("token not jwt-ish")
+        logger = logging.getLogger(__package__).getChild(cls.__qualname__)
 
-        # decode payload without verifying signature to extract aud/iss
-        header_b64, payload_b64, _sig = token.split(".", 2)
-        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
-        try:
-            unverified_payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")))
-        except Exception:
-            raise cgi_helper.UnauthorizedException("invalid token payload")
+        key_pem = JWT_SIGNING_KEY_PRIVATE_PEM
+        key = jwcrypto.jwk.JWK.from_pem(key_pem, password=None)
+        algorithm = JWT_ALGORITHM
+        issuer = JWT_ISSUER_URL
+        if api is None:
+            api = "DigitalOcean"
+        audience = f"api://{api}?actx={actx}"
 
-        issuer = unverified_payload.get("iss")
-        if not issuer:
-            raise cgi_helper.UnauthorizedException("token missing iss")
-        parsed_issuer = urllib.parse.urlparse(issuer)
-        actx = parsed_issuer.query.split("actx=", maxsplit=1)[1] if "actx=" in parsed_issuer.query else None
-        if not actx:
-            raise cgi_helper.UnauthorizedException("token missing actx")
+        claims = copy.deepcopy(claims)
+        if not f"actx:{actx}" in claims["sub"]:
+            raise AuthContextMissingFromSubjectError(
+                f'\'actx:{actx}\' not found in {claims["sub"]!r}'
+            )
+        if "ttl" in claims:
+            claims["exp"] = datetime.datetime.now(
+                tz=datetime.timezone.utc
+            ) + datetime.timedelta(seconds=claims["ttl"])
+            del claims["ttl"]
+        else:
+            claims["exp"] = datetime.datetime.now(
+                tz=datetime.timezone.utc
+            ) + datetime.timedelta(seconds=60 * 15)
+        claims["iat"] = datetime.datetime.now(tz=datetime.timezone.utc)
+        if "aud" not in claims:
+            claims["aud"] = audience
+        claims["iss"] = issuer
+        token_as_string = jwt.encode(
+            claims,
+            key_pem,
+            algorithm=algorithm,
+            headers={"kid": key.thumbprint()},
+        )
+        return cls(
+            actx=actx,
+            api=api,
+            aud=audience,
+            sub=claims["sub"],
+            claims=claims,
+            as_string=token_as_string,
+        )
 
-        # verify signature using issuer JWKS
-        oidc_api_endpoint = f"{parsed_issuer.scheme}://{parsed_issuer.netloc}"
-        keys = jwt_helper.get_keys(oidc_api_endpoint, api=api)
-        try:
-            claims = jwt.decode(token, keys, algorithms=["RS256"], audience=unverified_payload.get("aud"))
-        except Exception as e:
-            raise cgi_helper.UnauthorizedException(f"invalid token: {e}")
+    @classmethod
+    def validate(
+        cls,
+        token: str,
+        *,
+        get_issuers: Callable[[str, str], list[str]] = only_own_issuer,
+    ) -> "OIDCToken":
+        global THIS_ENDPOINT
+        global JWT_SIGNING_KEY_PUBLIC_PEM
 
-        return OIDCToken(actx=actx, sub=claims.get("sub", ""), claims=claims)
+        logger = logging.getLogger(__package__).getChild(cls.__qualname__)
 
-    @staticmethod
-    def create(actx: str, claims: dict, api=None):
-        # ttl in seconds
-        ttl = int(claims.get("ttl") or _env_int("ID_TOKEN_TTL_SECONDS", 900))
-        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-        claims = dict(claims)
-        claims["iat"] = now
-        claims["exp"] = now + ttl
-        # Ensure iss/aud exist (caller typically sets them)
-        # We leave them untouched if provided.
-        return OIDCToken(actx=actx, sub=claims.get("sub", ""), claims=claims)
+        # Remove "Bearer:"
+        if token == "0":
+            raise UnauthorizedException("Unable to authenticate you, no token")
+        elif token.count(".") != 2:
+            raise UnauthorizedException("Invalid token")
+        # actx extracted from audiance. Audiance rebuilt and then
+        # used to validate against extracted actx roles  policies
+        unverified_payload = jwt.decode(token, options={"verify_signature": False})
+        unverified_issuer = unverified_payload.get("iss")
+        unverified_audience = unverified_payload.get("aud")
+        parsed_url = urllib.parse.urlparse(unverified_audience)
+        query_string = parsed_url.query
+        query_params = urllib.parse.parse_qs(query_string)
+        import snoop
+
+        snoop.pp(query_params)
+        if len(query_params["actx"]) != 1:
+            raise UnauthorizedException(
+                f"aud does not have actx: api://{parsed_url.hostname}?actx=<identifier>"
+            )
+        actx = query_params["actx"][0]
+        api = unverified_audience.split("api://", maxsplit=1)[1].split("?", maxsplit=1)[
+            0
+        ]
+        issuers = [THIS_ENDPOINT]
+        issuers.extend(get_issuers(api, actx))
+        issuers = list(set(issuers))
+        config = OIDCValidatorConfig(
+            issuers=issuers,
+            audience=f"api://{api}?actx={actx}",
+            strict_aud=True,
+            leeway=0,
+            claim_schema=None,
+        )
+        logger.info(f"Validating token using config: {config}")
+        oidc = OIDCValidator(config)
+        claims = oidc.validate_token(token)
+        audience = claims.get("aud")
+        subject = claims.get("sub")
+        return cls(
+            actx=actx,
+            api=api,
+            aud=audience,
+            sub=subject,
+            claims=claims,
+            as_string=token,
+        )
