@@ -53,9 +53,7 @@ class ProvisioningData:
         if ttl is None:
             ttl = DEFAULT_TTL_SECONDS
 
-        token = oidc_helper.OIDCToken.create(
-            team_uuid,
-            {"nonce": nonce, "sub": f"actx:{team_uuid}:role:provisioning:nonce:{nonce}", "ttl": ttl},
+        token = oidc_helper.OIDCToken.create(str(team_uuid), {"nonce": nonce, "sub": f"actx:{team_uuid}:role:provisioning:nonce:{nonce}", "ttl": ttl},
         )
 
         # TODO Handle case where user_data is script
