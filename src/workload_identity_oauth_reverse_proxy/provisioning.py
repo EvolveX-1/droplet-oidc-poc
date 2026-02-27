@@ -55,7 +55,7 @@ class ProvisioningData:
 
         token = oidc_helper.OIDCToken.create(
             team_uuid,
-            {"nonce": nonce, "sub": f"actx:{team_uuid}:role:provisioning:nonce:{nonce}", "iss": THIS_ENDPOINT, "aud": f"api://DigitalOcean?actx={team_uuid}", "ttl": ttl},
+            {"nonce": nonce, "sub": f"actx:{team_uuid}:role:provisioning:nonce:{nonce}", "ttl": ttl, "iss": THIS_ENDPOINT, "actx": team_uuid, "aud": f"api://DigitalOcean?actx={team_uuid}"},
         )
 
         # TODO Handle case where user_data is script
