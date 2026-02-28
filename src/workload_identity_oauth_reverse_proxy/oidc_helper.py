@@ -1,47 +1,38 @@
+# -*- coding: utf-8 -*-
 """
-OIDC/JWT helper utilities for the DigitalOcean OIDC reverse-proxy app.
+OIDC helper utilities for the DigitalOcean Workload Identity OAuth reverse proxy.
 
-Key goals for this helper (based on field issues we hit):
-- Never crash the API handlers on obvious auth failures (return 401/4xx upstream).
-- Keep token creation/validation logic self-contained and dependency-light.
-- Be backward-compatible with older code paths (e.g., allow an optional `api`
-  field on tokens without breaking callers).
-
-This module is imported by provisioning/prove/refresh routes.
+Goals of this module:
+- Never return HTTP 500 for "bad token" / "missing claims" situations.
+  Those should raise cgi_helper.UnauthorizedException so the CGI wrapper can
+  translate them into a 401 JSON response.
+- Ensure any JWT claims we *create* are JSON-serializable (UUID/datetime -> str/int).
 """
+
 from __future__ import annotations
 
 import base64
+import dataclasses
+import datetime
 import json
+import logging
 import os
-import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+import urllib.parse
+from typing import Any, Callable
 
 import jwt
 
-from .common import THIS_ENDPOINT
-from . import database
-from .jwt_helper import JWT_ALGORITHM, JWT_ISSUER_URL, JWT_SIGNING_KEY_PRIVATE_PEM, JWT_SIGNING_KEY_PUBLIC_PEM
+from . import cgi_helper
+from . import jwt_helper
 
+logger = logging.getLogger(__package__)
 
-# ------------------------- Exceptions -------------------------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-class UnauthorizedError(Exception):
-    """Raised for authentication/authorization failures."""
-
-
-class AuthContextMissingFromSubjectError(UnauthorizedError):
-    """Raised when a token subject is missing the expected auth context."""
-
-
-# ------------------------- Config -------------------------
-
-DEFAULT_API = "DigitalOcean"
-
-def _int_env(name: str, default: int) -> int:
-    v = os.environ.get(name)
+def _env_int(name: str, default: int) -> int:
+    v = (os.environ.get(name) or "").strip()
     if not v:
         return default
     try:
@@ -49,177 +40,206 @@ def _int_env(name: str, default: int) -> int:
     except Exception:
         return default
 
-# Recommended defaults:
-# - Provisioning token TTL should be long enough to survive cloud-init delays, but short.
-# - Access/refresh TTLs are handled by their own flows; this is for ID-like tokens.
-ID_TOKEN_TTL_SECONDS = _int_env("ID_TOKEN_TTL_SECONDS", 15 * 60)  # 900s default
+
+def _to_epoch_seconds(dt: datetime.datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int(dt.timestamp())
 
 
-# ------------------------- Helpers -------------------------
-
-def _b64url_json(payload: Dict[str, Any]) -> str:
-    return base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _aud_for(actx: str, api: str) -> str:
-    # Include actx in aud for unambiguous binding.
-    return f"api://{api}?actx={actx}"
-
-def _normalize_actx_from_aud(aud: str) -> Optional[str]:
-    # Extract actx=<...> from audience string.
-    # aud may be "api://DigitalOcean?actx=TEAM_UUID" or a list; caller handles list.
+def _json_safe(obj: Any) -> Any:
+    """
+    Convert common non-JSON types that can accidentally appear in JWT claims.
+    """
+    if isinstance(obj, datetime.datetime):
+        return _to_epoch_seconds(obj)
+    # date (no time)
+    if isinstance(obj, datetime.date) and not isinstance(obj, datetime.datetime):
+        return int(datetime.datetime(obj.year, obj.month, obj.day, tzinfo=datetime.timezone.utc).timestamp())
+    # UUIDs
     try:
-        if "actx=" not in aud:
-            return None
-        return aud.split("actx=", 1)[1].split("&", 1)[0]
+        import uuid as _uuid
+        if isinstance(obj, _uuid.UUID):
+            return str(obj)
     except Exception:
-        return None
+        pass
+    return obj
 
 
-# ------------------------- Token type -------------------------
+def _sanitize_claims(claims: dict) -> dict:
+    """
+    Deep-ish sanitize a claims dict so json.dumps never raises due to UUID/datetime.
+    """
+    out: dict[str, Any] = {}
+    for k, v in (claims or {}).items():
+        if isinstance(v, dict):
+            out[k] = _sanitize_claims(v)
+        elif isinstance(v, list):
+            out[k] = [_json_safe(x) for x in v]
+        else:
+            out[k] = _json_safe(v)
+    return out
 
-@dataclass(frozen=True)
+
+def _parse_actx_and_api_from_aud(aud: str) -> tuple[str, str]:
+    """
+    Expected audience format: api://<api>?actx=<identifier>
+    """
+    if not aud or not isinstance(aud, str):
+        raise cgi_helper.UnauthorizedException("token missing aud")
+
+    if not aud.startswith("api://"):
+        raise cgi_helper.UnauthorizedException("aud must start with api://")
+
+    parsed = urllib.parse.urlparse(aud)
+    # urlparse("api://x?actx=y") => scheme=api, netloc=x, query=actx=y
+    api = parsed.netloc
+    qs = urllib.parse.parse_qs(parsed.query or "")
+    actx_list = qs.get("actx") or []
+    if len(actx_list) != 1 or not actx_list[0]:
+        raise cgi_helper.UnauthorizedException("token missing actx")
+    return actx_list[0], api
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
 class OIDCToken:
-    """
-    Representation of a signed JWT created/validated by this service.
-    """
     actx: str
+    api: str
     aud: str
     sub: str
-    claims: Dict[str, Any]
+    claims: dict
     as_string: str
-    # Optional field kept for backward compatibility (some earlier iterations used it).
-    api: str = DEFAULT_API
-
-    @staticmethod
-    def _load_keys() -> Tuple[str, str]:
-        """
-        Returns (private_pem, public_pem) as UTF-8 strings.
-        Values are sourced from jwt_helper/database (already initialized elsewhere).
-        """
-        priv = JWT_SIGNING_KEY_PRIVATE_PEM
-        pub = JWT_SIGNING_KEY_PUBLIC_PEM
-
-        # jwt_helper exports bytes in some versions. Normalize to str.
-        if isinstance(priv, (bytes, bytearray)):
-            priv = priv.decode("utf-8")
-        if isinstance(pub, (bytes, bytearray)):
-            pub = pub.decode("utf-8")
-
-        return priv, pub
 
     @classmethod
-    def create(
-        cls,
-        actx: str,
-        claims: Dict[str, Any],
-        *,
-        api: str = DEFAULT_API,
-        ttl_seconds: Optional[int] = None,
-    ) -> "OIDCToken":
+    def create(cls, actx: str, claims: dict, api: str | None = None) -> "OIDCToken":
         """
-        Create and sign a JWT.
-
-        NOTE: We intentionally DO NOT enforce a specific `sub` format here.
-        Callers (provisioning/issue) should set `sub` appropriately.
+        Create a signed JWT using the local RSA signing key (jwt_helper.key).
+        - Ensures exp/iat are epoch seconds.
+        - Ensures claims are JSON serializable.
         """
-        if not actx:
-            raise ValueError("actx required")
-        if "sub" not in claims or not claims["sub"]:
-            raise ValueError("claims.sub required")
+        if api is None:
+            api = "DigitalOcean"
 
-        ttl = int(ttl_seconds if ttl_seconds is not None else ID_TOKEN_TTL_SECONDS)
-        now = _utcnow()
-        exp = now + timedelta(seconds=max(60, ttl))  # never less than 60s
+        # default TTL: 15 min (or env override)
+        ttl = int((claims or {}).get("ttl") or _env_int("ID_TOKEN_TTL_SECONDS", 900))
+        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
-        # Standard claims
-        full_claims = dict(claims)
-        full_claims.setdefault("iss", JWT_ISSUER_URL or THIS_ENDPOINT)
-        full_claims.setdefault("iat", int(now.timestamp()))
-        full_claims.setdefault("nbf", int(now.timestamp()))
-        full_claims.setdefault("exp", int(exp.timestamp()))
-        full_claims.setdefault("aud", _aud_for(actx, api))
+        audience = f"api://{api}?actx={actx}"
 
-        # Sign
-        priv_pem, _ = cls._load_keys()
-        token_str = jwt.encode(full_claims, priv_pem, algorithm=JWT_ALGORITHM)
+        c = _sanitize_claims(dict(claims or {}))
+        c.pop("ttl", None)
 
-        aud = full_claims["aud"]
-        sub = full_claims["sub"]
-        return cls(actx=actx, api=api, aud=aud, sub=sub, claims=full_claims, as_string=token_str)
+        # Required-ish claims
+        c.setdefault("aud", audience)
+        c.setdefault("iss", (os.environ.get("THIS_ENDPOINT") or os.environ.get("JWT_ISSUER_URL") or "").strip())
+        if not c.get("iss"):
+            # We prefer explicit env, but fail safe with something readable.
+            c["iss"] = "unknown-issuer"
+
+        c["iat"] = int(c.get("iat", now))
+        c["exp"] = int(c.get("exp", now + ttl))
+
+        # sub is required for our policy matching; enforce presence.
+        sub = str(c.get("sub") or "")
+        if not sub:
+            raise cgi_helper.UnauthorizedException("missing sub")
+        c["sub"] = sub
+
+        token_as_string = jwt.encode(c, jwt_helper.key, algorithm="RS256")
+        return cls(
+            actx=actx,
+            api=api,
+            aud=audience,
+            sub=sub,
+            claims=c,
+            as_string=token_as_string,
+        )
 
     @classmethod
     def validate(
         cls,
         token: str,
         *,
-        expected_api: str = DEFAULT_API,
-        require_actx_in_aud: bool = True,
-        leeway_seconds: int = 10,
+        api: str | None = None,
+        get_issuers: Callable[[str, str], list[str]] | None = None,
     ) -> "OIDCToken":
         """
-        Validate a JWT and return an OIDCToken.
-
-        - Always verifies signature.
-        - Verifies `iss` if present.
-        - Verifies expiry.
-        - Verifies audience format and extracts `actx`.
+        Validate a JWT:
+        - Structural checks
+        - Extract actx/api from aud (NOT from iss)
+        - Ensure iss is present
+        - Verify signature using issuer JWKS via jwt_helper.get_keys()
         """
-        if not token or token.count(".") != 2:
-            raise UnauthorizedError("token not jwt-ish")
+        if token == "0" or not token:
+            raise cgi_helper.UnauthorizedException("Unable to authenticate you, no token")
 
-        _, pub_pem = cls._load_keys()
+        if token.count(".") != 2:
+            raise cgi_helper.UnauthorizedException("token not jwt-ish")
 
-        # Decode; we validate audience manually because it includes query params.
+        # Decode payload without verifying signature to extract iss/aud
         try:
-            decoded = jwt.decode(
-                token,
-                pub_pem,
-                algorithms=[JWT_ALGORITHM],
-                options={
-                    "verify_signature": True,
-                    "verify_exp": True,
-                    "verify_nbf": True,
-                    "verify_iat": True,
-                    "verify_aud": False,
-                },
-                leeway=leeway_seconds,
-            )
-        except jwt.ExpiredSignatureError:
-            raise UnauthorizedError("token expired")
-        except jwt.InvalidTokenError as e:
-            raise UnauthorizedError(f"invalid token: {e}")
+            _hdr_b64, payload_b64, _sig = token.split(".", 2)
+            payload_b64 += "=" * ((4 - (len(payload_b64) % 4)) % 4)
+            unverified_payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")))
+        except Exception:
+            raise cgi_helper.UnauthorizedException("invalid token payload")
 
-        aud_claim = decoded.get("aud")
-        aud: Optional[str] = None
-        if isinstance(aud_claim, str):
-            aud = aud_claim
-        elif isinstance(aud_claim, (list, tuple)) and aud_claim:
-            # PyJWT may decode aud as list.
-            aud = str(aud_claim[0])
+        issuer = unverified_payload.get("iss")
+        if not issuer:
+            raise cgi_helper.UnauthorizedException("token missing iss")
 
-        if not aud:
-            raise UnauthorizedError("token missing aud")
+        aud = unverified_payload.get("aud")
+        actx, parsed_api = _parse_actx_and_api_from_aud(aud)
 
-        actx = _normalize_actx_from_aud(aud) if require_actx_in_aud else None
-        if require_actx_in_aud and not actx:
-            raise UnauthorizedError("token missing actx")
+        if api is None:
+            api = parsed_api
 
-        # Optional issuer check (allow legacy tokens that omitted iss during earlier experiments)
-        iss = decoded.get("iss")
-        if iss and JWT_ISSUER_URL and iss != JWT_ISSUER_URL:
-            raise UnauthorizedError("token bad iss")
+        # Determine which issuers are allowed for this api/actx
+        issuers = []
+        if get_issuers is not None:
+            try:
+                issuers.extend(get_issuers(api, actx))
+            except Exception:
+                # never hard-fail issuer discovery; we'll still validate against issuer in token
+                pass
+        # Always allow the issuer embedded in the token
+        issuers.append(issuer)
+        issuers = list(dict.fromkeys([x for x in issuers if x]))  # de-dupe, drop empties
 
-        sub = decoded.get("sub")
-        if not sub:
-            raise UnauthorizedError("token missing sub")
+        # Verify using the issuer's JWKS. jwt_helper.get_keys accepts base endpoint (scheme+netloc).
+        parsed_issuer = urllib.parse.urlparse(issuer)
+        base_endpoint = f"{parsed_issuer.scheme}://{parsed_issuer.netloc}"
 
-        # Keep api best-effort
-        api = expected_api
-        # If aud begins with api://X, prefer X
-        if aud.startswith("api://"):
-            api = aud[len("api://"):].split("?", 1)[0] or expected_api
+        keys = jwt_helper.get_keys(base_endpoint, api=api)
 
-        return cls(actx=actx or "", api=api, aud=aud, sub=sub, claims=decoded, as_string=token)
+        last_err: Exception | None = None
+        for iss in issuers:
+            try:
+                claims = jwt.decode(
+                    token,
+                    keys,
+                    algorithms=["RS256"],
+                    audience=aud,
+                    issuer=iss,
+                    options={"require": ["exp", "iat", "iss", "sub"]},
+                )
+                sub = str(claims.get("sub") or "")
+                if not sub:
+                    raise cgi_helper.UnauthorizedException("missing sub")
+                return cls(
+                    actx=actx,
+                    api=api,
+                    aud=str(claims.get("aud") or aud),
+                    sub=sub,
+                    claims=claims,
+                    as_string=token,
+                )
+            except jwt.PyJWTError as e:
+                last_err = e
+                continue
+
+        raise cgi_helper.UnauthorizedException(f"invalid token: {last_err}")  # type: ignore[arg-type]
