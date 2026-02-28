@@ -1,81 +1,35 @@
-import os
-import threading
 import jwcrypto.jwk
 
 from .common import THIS_ENDPOINT
 from . import database
 
+# Public issuer URL for tokens minted by this service
 JWT_ISSUER_URL = THIS_ENDPOINT
 JWT_ALGORITHM = "RS256"
 
-_lock = threading.Lock()
-_cached_private_jwk = None  # type: ignore
+# --- Load (or lazily generate) the RSA signing key ---
+# Upstream modules import these symbols directly:
+#   JWT_SIGNING_KEY_PRIVATE_PEM (str)
+#   JWT_SIGNING_KEY_PUBLIC_PEM  (str)
+_pem = database.get_jwk_pem(JWT_ISSUER_URL)  # may be None on first boot
 
+if _pem is None:
+    # First boot: generate and persist a new RSA keypair (4096-bit)
+    _jwk_priv = jwcrypto.jwk.JWK.generate(kty="RSA", size=4096)
+    JWT_SIGNING_KEY_PRIVATE_PEM = _jwk_priv.export_to_pem(private_key=True, password=None).decode()
+    JWT_SIGNING_KEY_PUBLIC_PEM = _jwk_priv.export_to_pem(private_key=False, password=None).decode()
+    database.save_jwk_pem(JWT_ISSUER_URL, JWT_SIGNING_KEY_PRIVATE_PEM)
+else:
+    # Subsequent boots: load existing private key from DB
+    if isinstance(_pem, (bytes, bytearray)):
+        _pem_str = _pem.decode()
+    else:
+        _pem_str = str(_pem)
 
-def _load_from_env() -> jwcrypto.jwk.JWK | None:
-    pem = os.getenv("JWT_SIGNING_KEY_PRIVATE_PEM", "").strip()
-    if not pem:
-        return None
-    try:
-        return jwcrypto.jwk.JWK.from_pem(pem.encode(), password=None)
-    except Exception:
-        # Bad PEM in env; treat as absent (do not crash import)
-        return None
+    _jwk_priv = jwcrypto.jwk.JWK.from_pem(_pem_str.encode(), password=None)
+    JWT_SIGNING_KEY_PRIVATE_PEM = _pem_str
+    JWT_SIGNING_KEY_PUBLIC_PEM = _jwk_priv.export_to_pem(private_key=False, password=None).decode()
 
-
-def _load_from_db() -> jwcrypto.jwk.JWK | None:
-    try:
-        pem = database.get_jwk_pem(JWT_ISSUER_URL)
-    except Exception:
-        return None
-    if not pem:
-        return None
-    try:
-        return jwcrypto.jwk.JWK.from_pem(pem.encode(), password=None)
-    except Exception:
-        return None
-
-
-def _save_to_db_best_effort(jwk: jwcrypto.jwk.JWK) -> None:
-    try:
-        pem = jwk.export_to_pem(private_key=True, password=None).decode()
-        database.save_jwk_pem(JWT_ISSUER_URL, pem)
-    except Exception:
-        # DB down / perms / schema / timeout — do not take down issuer
-        return
-
-
-def get_signing_jwk_private() -> jwcrypto.jwk.JWK:
-    """
-    Returns a stable signing key (JWK). Lazily loads from:
-      1) env JWT_SIGNING_KEY_PRIVATE_PEM (recommended for stability),
-      2) database,
-      3) generates new key (best-effort persisted).
-    Never raises during import-time.
-    """
-    global _cached_private_jwk
-    if _cached_private_jwk is not None:
-        return _cached_private_jwk
-
-    with _lock:
-        if _cached_private_jwk is not None:
-            return _cached_private_jwk
-
-        jwk = _load_from_env()
-        if jwk is None:
-            jwk = _load_from_db()
-
-        if jwk is None:
-            jwk = jwcrypto.jwk.JWK.generate(kty="RSA", size=4096)
-            _save_to_db_best_effort(jwk)
-
-        _cached_private_jwk = jwk
-        return _cached_private_jwk
-
-
-def get_signing_key_private_pem() -> str:
-    return get_signing_jwk_private().export_to_pem(private_key=True, password=None).decode()
-
-
-def get_signing_key_public_pem() -> str:
-    return get_signing_jwk_private().export_to_pem().decode()
+# Optional convenience objects (harmless if unused)
+JWT_SIGNING_KEY_PRIVATE = _jwk_priv
+JWT_SIGNING_KEY_PUBLIC = jwcrypto.jwk.JWK.from_pem(JWT_SIGNING_KEY_PUBLIC_PEM.encode(), password=None)
